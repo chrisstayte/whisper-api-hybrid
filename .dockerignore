@@ -1,0 +1,8 @@
+.env
+.git
+.gitignore
+__pycache__
+venv
+whisper_models/
+*.mp3
+models/

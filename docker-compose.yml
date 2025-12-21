@@ -1,0 +1,11 @@
+services:
+  whisper-api:
+    container_name: whisper-api
+    build: .
+    ports:
+      - "8001:8000"
+    env_file:
+      - .env
+    volumes:
+      - ./models:/root/.cache/huggingface # Cache models so they don't redownload
+    restart: unless-stopped

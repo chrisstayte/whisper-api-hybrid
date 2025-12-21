@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+requests
+pydantic
+faster-whisper
+openai
+pydub
+python-dotenv
