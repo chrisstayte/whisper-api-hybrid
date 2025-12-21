@@ -61,6 +61,7 @@ def process_transcription(req: TranscriptionRequest):
     with transcription_lock:
         temp_file = f"/tmp/{req.job_id}.mp3"
         logger.info(f"--- LOCK ACQUIRED | STARTING JOB: {req.job_id} ---")
+        logger.info(f"Callback url: {req.callback_url}")
         
         try:
             # Step 1: Download
@@ -121,14 +122,18 @@ def process_transcription(req: TranscriptionRequest):
 
             # Step 3: Callback
             logger.info(f"Step 3/3: Pushing results to {req.callback_url}")
-            cb_res = requests.post(
-                req.callback_url, 
-                json={
+            payload = {
                     "job_id": req.job_id,
                     "status": "completed",
                     "transcription": payload_content,
                     "secret": CALLBACK_SECRET
-                }, 
+            }
+       
+
+
+            cb_res = requests.post(
+                req.callback_url, 
+                json=payload, 
                 headers={"X-Callback-Secret": CALLBACK_SECRET},
                 timeout=30
             )
