@@ -23,8 +23,18 @@ logger = logging.getLogger(__name__)
 
 load_dotenv()
 
-# 2. Global Lock for Sequential Processing
-transcription_lock = threading.Lock()
+# 2. Concurrency Control
+try:
+    MAX_CONCURRENT_JOBS = int(os.getenv("MAX_CONCURRENT_JOBS", "0"))
+except ValueError:
+    logger.warning("Invalid MAX_CONCURRENT_JOBS value, defaulting to 0")
+    MAX_CONCURRENT_JOBS = 0
+if MAX_CONCURRENT_JOBS == 0:
+    transcription_semaphore = None
+    logger.info("Concurrency limit: unlimited")
+else:
+    transcription_semaphore = threading.Semaphore(MAX_CONCURRENT_JOBS)
+    logger.info(f"Concurrency limit: {MAX_CONCURRENT_JOBS}")
 
 app = FastAPI()
 
@@ -57,10 +67,9 @@ async def verify_secret(x_callback_secret: Annotated[str | None, Header()] = Non
         raise HTTPException(status_code=401, detail="Invalid Callback Secret")
 
 def process_transcription(req: TranscriptionRequest):
-    # Sequential lock starts here
-    with transcription_lock:
+    def _run():
         temp_file = f"/tmp/{req.job_id}.mp3"
-        logger.info(f"--- LOCK ACQUIRED | STARTING JOB: {req.job_id} ---")
+        logger.info(f"--- SLOT ACQUIRED | STARTING JOB: {req.job_id} ---")
         logger.info(f"Callback url: {req.callback_url}")
         
         try:
@@ -159,7 +168,13 @@ def process_transcription(req: TranscriptionRequest):
             if os.path.exists(temp_file):
                 os.remove(temp_file)
                 logger.info("Cleanup complete.")
-            logger.info(f"--- JOB {req.job_id} FINISHED | RELEASING LOCK ---")
+            logger.info(f"--- JOB {req.job_id} FINISHED | RELEASING SLOT ---")
+
+    if transcription_semaphore is not None:
+        with transcription_semaphore:
+            _run()
+    else:
+        _run()
 
 @app.post("/transcribe", dependencies=[Depends(verify_secret)])
 async def start_transcription(req: TranscriptionRequest, background_tasks: BackgroundTasks):
