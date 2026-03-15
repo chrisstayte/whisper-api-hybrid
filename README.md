@@ -44,7 +44,7 @@ USE_GPU=false
 CALLBACK_SECRET=your_secret_passphrase
 
 # Maximum number of concurrent transcription jobs (0 = unlimited)
-MAX_CONCURRENT_JOBS=1
+MAX_CONCURRENT_JOBS=0
 ```
 
 ### 3. Run it
@@ -63,7 +63,7 @@ The API is available at `http://localhost:3443`.
 | `USE_GPU` | Enable CUDA for local transcription (requires NVIDIA GPU + runtime) | `false` |
 | `CALLBACK_SECRET` | Shared secret for authenticating requests and verifying callbacks | _none_ |
 | `OPENAI_API_KEY` | OpenAI API key (required only when using the `openai` provider) | _none_ |
-| `MAX_CONCURRENT_JOBS` | Maximum number of transcription jobs that can run at the same time (`0` = unlimited) | `1` |
+| `MAX_CONCURRENT_JOBS` | Maximum number of transcription jobs that can run at the same time (`0` = unlimited) | `0` |
 
 ## Docker Compose Examples
 
@@ -269,7 +269,7 @@ The callback includes the `X-Callback-Secret` header if `CALLBACK_SECRET` is con
 
 1. **Request** — you POST to `/transcribe` with an audio URL and callback URL
 2. **Queue** — the server accepts immediately and processes in the background
-3. **Concurrency control** — a configurable semaphore limits how many jobs run at once (default: 1, set to 0 for unlimited)
+3. **Concurrency control** — a configurable semaphore limits how many jobs run at once (default: 0 = unlimited)
 4. **Download** — the audio file is downloaded to a temp location
 5. **Transcribe** — either locally via faster-whisper, or via OpenAI (auto-chunked if needed)
 6. **Callback** — results (text + timestamps) are POSTed to your callback URL

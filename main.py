@@ -25,10 +25,10 @@ load_dotenv()
 
 # 2. Concurrency Control
 try:
-    MAX_CONCURRENT_JOBS = int(os.getenv("MAX_CONCURRENT_JOBS", "1"))
+    MAX_CONCURRENT_JOBS = int(os.getenv("MAX_CONCURRENT_JOBS", "0"))
 except ValueError:
-    logger.warning("Invalid MAX_CONCURRENT_JOBS value, defaulting to 1")
-    MAX_CONCURRENT_JOBS = 1
+    logger.warning("Invalid MAX_CONCURRENT_JOBS value, defaulting to 0")
+    MAX_CONCURRENT_JOBS = 0
 if MAX_CONCURRENT_JOBS == 0:
     transcription_semaphore = None
     logger.info("Concurrency limit: unlimited")
