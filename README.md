@@ -1,121 +1,260 @@
 # Whisper API Hybrid
 
-A robust, FastAPI-based audio transcription service that offers a hybrid approach to transcription. You can choose between running a local instance of `faster-whisper` for cost-effective, private transcription, or offload the task to OpenAI's Whisper API for higher throughput or specific use cases.
+A FastAPI-based audio transcription service with a hybrid approach: run [faster-whisper](https://github.com/guillaumekln/faster-whisper) locally for private, cost-effective transcription, or offload to [OpenAI's Whisper API](https://platform.openai.com/docs/guides/speech-to-text) for higher throughput — switchable per request.
 
 ## Features
 
-- **Hybrid Providers**: Switch between `local` (on-device) and `openai` (cloud) transcription providers per request.
-- **Asynchronous Processing**: Jobs are queued and processed in the background.
-- **Sequential Execution**: A global lock ensures that local resources are not overwhelmed by concurrent transcription jobs.
-- **Callback System**: Results are pushed to a webhook URL upon completion, so you don't have to poll for status.
-- **Large File Support**: Automatically splits large audio files when using the OpenAI provider to adhere to API limits.
-- **Secure**: Optional secret token validation for incoming requests and outgoing callbacks.
-- **Docker Ready**: Fully containerized with Docker and Docker Compose.
+- **Hybrid providers** — choose `local` or `openai` per request
+- **Async job queue** — requests are accepted immediately and processed in the background
+- **Sequential locking** — a global lock prevents local model overload from concurrent jobs
+- **Webhook callbacks** — results are POSTed to your URL when done, no polling needed
+- **Large file support** — auto-splits audio into chunks for OpenAI's 25 MB limit
+- **Optional auth** — secret token validation on both incoming requests and outgoing callbacks
+- **Multi-arch Docker image** — prebuilt for `linux/amd64` and `linux/arm64`
 
-## Prerequisites
+## Quick Start
 
-- **Docker** and **Docker Compose** installed on your machine.
-- **OpenAI API Key** (optional, only if using the `openai` provider).
+### 1. Pull the image
 
-## Configuration
+Prebuilt images are published to GitHub Container Registry on every push to `main`.
 
-The application is configured via environment variables. You can set these in a `.env` file or in your `docker-compose.yml`.
+```bash
+docker pull ghcr.io/chrisstayte/whisper-api-hybrid:latest
+```
 
-| Variable          | Description                                                                                                | Default |
-| ----------------- | ---------------------------------------------------------------------------------------------------------- | ------- |
-| `WHISPER_MODEL`   | The size of the local Whisper model to load (e.g., `tiny`, `base`, `small`, `medium`, `large-v2`).         | `base`  |
-| `USE_GPU`         | Set to `true` to use CUDA for local transcription. Requires a compatible NVIDIA GPU and container runtime. | `false` |
-| `CALLBACK_SECRET` | A secret string used to authenticate requests to this API and verify callbacks sent by it.                 | `None`  |
-| `OPENAI_API_KEY`  | Your OpenAI API key. Required only if `provider` is set to `openai`.                                       | `None`  |
+### 2. Create an environment file
 
-## Installation & Usage
+```bash
+cp .env.example .env
+```
 
-1.  **Clone the repository:**
+Edit `.env` with your values:
 
-    ```bash
-    git clone <repository-url>
-    cd whisper-api-hybrid
-    ```
+```dotenv
+# Required only if using the "openai" provider
+OPENAI_API_KEY=sk-proj-your-actual-key
 
-2.  **Set up environment variables:**
-    Create a `.env` file or modify `docker-compose.yml` with your desired settings.
+# Local whisper model size: tiny, base, small, medium, large-v2
+WHISPER_MODEL=small
 
-3.  **Run with Docker Compose:**
-    ```bash
-    docker compose up -d
-    ```
-    The API will be available at `http://localhost:3443`.
+# Set to "true" if you have an NVIDIA GPU with the NVIDIA Container Toolkit installed
+USE_GPU=false
+
+# Optional shared secret for request authentication and callback verification
+CALLBACK_SECRET=your_secret_passphrase
+```
+
+### 3. Run it
+
+```bash
+docker compose up -d
+```
+
+The API is available at `http://localhost:3443`.
+
+## Environment Variables
+
+| Variable | Description | Default |
+|---|---|---|
+| `WHISPER_MODEL` | Local model size (`tiny`, `base`, `small`, `medium`, `large-v2`) | `base` |
+| `USE_GPU` | Enable CUDA for local transcription (requires NVIDIA GPU + runtime) | `false` |
+| `CALLBACK_SECRET` | Shared secret for authenticating requests and verifying callbacks | _none_ |
+| `OPENAI_API_KEY` | OpenAI API key (required only when using the `openai` provider) | _none_ |
+
+## Docker Compose Examples
+
+### CPU-only (simplest setup)
+
+```yaml
+services:
+  whisper-api:
+    image: ghcr.io/chrisstayte/whisper-api-hybrid:latest
+    ports:
+      - "3443:8000"
+    env_file:
+      - .env
+    volumes:
+      - whisper-models:/root/.cache/huggingface
+    restart: unless-stopped
+
+volumes:
+  whisper-models:
+```
+
+### NVIDIA GPU
+
+Requires the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html).
+
+```yaml
+services:
+  whisper-api:
+    image: ghcr.io/chrisstayte/whisper-api-hybrid:latest
+    ports:
+      - "3443:8000"
+    env_file:
+      - .env
+    volumes:
+      - whisper-models:/root/.cache/huggingface
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+volumes:
+  whisper-models:
+```
+
+Set `USE_GPU=true` in your `.env` file.
+
+### OpenAI-only (no local model needed)
+
+If you only plan to use the OpenAI provider, the container still starts the local model on boot. For the smallest footprint, use `WHISPER_MODEL=tiny`.
+
+```yaml
+services:
+  whisper-api:
+    image: ghcr.io/chrisstayte/whisper-api-hybrid:latest
+    ports:
+      - "3443:8000"
+    environment:
+      - OPENAI_API_KEY=sk-proj-your-key
+      - WHISPER_MODEL=tiny
+    restart: unless-stopped
+```
+
+### Build from source
+
+If you prefer to build locally instead of pulling the prebuilt image:
+
+```yaml
+services:
+  whisper-api:
+    build: .
+    ports:
+      - "3443:8000"
+    env_file:
+      - .env
+    volumes:
+      - whisper-models:/root/.cache/huggingface
+    restart: unless-stopped
+
+volumes:
+  whisper-models:
+```
+
+```bash
+docker compose up -d --build
+```
+
+### With a reverse proxy (Caddy)
+
+```yaml
+services:
+  whisper-api:
+    image: ghcr.io/chrisstayte/whisper-api-hybrid:latest
+    env_file:
+      - .env
+    volumes:
+      - whisper-models:/root/.cache/huggingface
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile
+      - caddy-data:/data
+    restart: unless-stopped
+
+volumes:
+  whisper-models:
+  caddy-data:
+```
+
+Example `Caddyfile`:
+
+```
+whisper.example.com {
+    reverse_proxy whisper-api:8000
+}
+```
 
 ## API Reference
 
-### Start Transcription
+### `POST /transcribe`
 
-**Endpoint:** `POST /transcribe`
+Submits an audio file for transcription. The job is processed asynchronously and results are delivered via webhook callback.
 
-**Headers:**
+**Headers**
 
-- `X-Callback-Secret`: (Optional) Must match `CALLBACK_SECRET` if set in the environment.
+| Header | Required | Description |
+|---|---|---|
+| `X-Callback-Secret` | Only if `CALLBACK_SECRET` is set | Must match the configured secret |
 
-**Request Body:**
+**Request Body**
 
 ```json
 {
-  "file_url": "https://example.com/path/to/audio.mp3",
-  "job_id": "unique-job-identifier-123",
+  "file_url": "https://example.com/audio.mp3",
+  "job_id": "unique-job-123",
   "callback_url": "https://your-server.com/webhook",
   "provider": "local"
 }
 ```
 
-| Field          | Type   | Description                                     |
-| -------------- | ------ | ----------------------------------------------- |
-| `file_url`     | string | Direct URL to the audio file to be transcribed. |
-| `job_id`       | string | A unique identifier for this job.               |
-| `callback_url` | string | The URL where the results will be POSTed.       |
-| `provider`     | string | `local` (default) or `openai`.                  |
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `file_url` | string | yes | Direct URL to the audio file |
+| `job_id` | string | yes | Unique identifier for this job |
+| `callback_url` | string | yes | URL where results will be POSTed |
+| `provider` | string | no | `local` (default) or `openai` |
 
-**Response:**
+**Response** `200 OK`
 
 ```json
 {
   "status": "accepted",
-  "job_id": "unique-job-identifier-123"
+  "job_id": "unique-job-123"
 }
 ```
 
-## Callback Payload
+### Callback Payload
 
-Once the transcription is finished, the service will send a `POST` request to your `callback_url`.
+When transcription completes, the service sends a `POST` to your `callback_url`.
 
-**Headers:**
+The callback includes the `X-Callback-Secret` header if `CALLBACK_SECRET` is configured.
 
-- `X-Callback-Secret`: (Optional) Matches `CALLBACK_SECRET` if set in the environment.
-
-### Success Response
+**Success**
 
 ```json
 {
-  "job_id": "unique-job-identifier-123",
+  "job_id": "unique-job-123",
   "status": "completed",
   "transcription": [
     {
       "text": "Hello, this is a test.",
-      "timestamp": "00:00:00-00:00:02"
+      "timestamp": "00:00-00:02"
     },
     {
       "text": "Welcome to the hybrid whisper API.",
-      "timestamp": "00:00:02-00:00:05"
+      "timestamp": "00:02-00:05"
     }
   ],
   "secret": "your-configured-callback-secret"
 }
 ```
 
-### Failure Response
+**Failure**
 
 ```json
 {
-  "job_id": "unique-job-identifier-123",
+  "job_id": "unique-job-123",
   "status": "failed",
   "error": "Description of what went wrong",
   "secret": "your-configured-callback-secret"
@@ -124,20 +263,48 @@ Once the transcription is finished, the service will send a `POST` request to yo
 
 ## How It Works
 
-1.  **Request**: You send a request to `/transcribe` with the audio URL and a callback URL.
-2.  **Queue**: The server accepts the request immediately and processes it in the background.
-3.  **Lock**: A global lock ensures that only one transcription job runs at a time to prevent server overload (especially important for the local model).
-4.  **Download**: The server downloads the audio file to a temporary location.
-5.  **Transcribe**:
-    - **Local**: Uses `faster-whisper` to process the file.
-    - **OpenAI**: Splits the file into chunks (if necessary) and sends them to the OpenAI Whisper API.
-6.  **Callback**: The results (text and timestamps) are formatted and sent to your `callback_url`.
-7.  **Cleanup**: Temporary files are deleted.
+1. **Request** — you POST to `/transcribe` with an audio URL and callback URL
+2. **Queue** — the server accepts immediately and processes in the background
+3. **Lock** — a global lock ensures only one job runs at a time (prevents local model overload)
+4. **Download** — the audio file is downloaded to a temp location
+5. **Transcribe** — either locally via faster-whisper, or via OpenAI (auto-chunked if needed)
+6. **Callback** — results (text + timestamps) are POSTed to your callback URL
+7. **Cleanup** — temp files are deleted
+
+## CI/CD
+
+The GitHub Actions workflow (`.github/workflows/docker.yml`) runs on every push to `main`:
+
+1. Auto-bumps the version (semver patch)
+2. Builds a multi-arch Docker image (`linux/amd64` + `linux/arm64`) using buildx
+3. Pushes to `ghcr.io/chrisstayte/whisper-api-hybrid` with `latest` and versioned tags
+4. Creates a GitHub Release with changelog
+
+To trigger a minor or major bump, include `#minor` or `#major` in your commit message.
+
+## Local Development
+
+```bash
+# Clone
+git clone https://github.com/chrisstayte/whisper-api-hybrid.git
+cd whisper-api-hybrid
+
+# Create env file
+cp .env.example .env
+
+# Install dependencies
+pip install -r requirements.txt
+
+# Run the server
+uvicorn main:app --host 0.0.0.0 --port 8000
+```
+
+Requires Python 3.10+ and ffmpeg installed on your system.
 
 ## Dependencies
 
-- [FastAPI](https://fastapi.tiangolo.com/)
-- [Faster Whisper](https://github.com/guillaumekln/faster-whisper)
-- [OpenAI Python Client](https://github.com/openai/openai-python)
-- [PyDub](https://github.com/jiaaro/pydub)
-- FFmpeg (installed in Docker image)
+- [FastAPI](https://fastapi.tiangolo.com/) — web framework
+- [faster-whisper](https://github.com/guillaumekln/faster-whisper) — local transcription engine
+- [OpenAI Python](https://github.com/openai/openai-python) — cloud transcription
+- [PyDub](https://github.com/jiaaro/pydub) — audio chunking
+- [FFmpeg](https://ffmpeg.org/) — audio processing (installed in Docker image)
