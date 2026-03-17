@@ -108,7 +108,7 @@ def _get_system_info() -> dict:
         if torch.cuda.is_available():
             info["cuda_device_count"] = torch.cuda.device_count()
             info["cuda_device_name"] = torch.cuda.get_device_name(0)
-            mem = torch.cuda.get_device_properties(0).total_mem
+            mem = torch.cuda.get_device_properties(0).total_memory
             info["cuda_memory_mb"] = round(mem / (1024**2), 1)
     except ImportError:
         info["cuda_available"] = False
