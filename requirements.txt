@@ -6,3 +6,4 @@ faster-whisper
 openai
 pydub
 python-dotenv
+python-json-logger
