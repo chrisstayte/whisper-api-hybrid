@@ -39,9 +39,15 @@ else:
 
 app = FastAPI()
 
-# Job Registry
+# Job Registry (in-memory; job history is lost on application restart)
 jobs_lock = threading.Lock()
 jobs: dict[str, dict] = {}
+
+STATUS_QUEUED = "queued"
+STATUS_DOWNLOADING = "downloading"
+STATUS_TRANSCRIBING = "transcribing"
+STATUS_COMPLETED = "completed"
+STATUS_FAILED = "failed"
 
 
 class JobStatus(BaseModel):
@@ -56,10 +62,12 @@ class JobsResponse(BaseModel):
 
 
 def _extract_file_name(url: str) -> str:
-    """Extract the original file name from a URL."""
+    """Extract the original file name from a URL, sanitized for safety."""
     path = urlparse(url).path
     name = os.path.basename(unquote(path))
-    return name if name else "unknown"
+    # Remove any directory traversal or path separator characters
+    name = name.replace("..", "").replace("/", "").replace("\\", "")
+    return name.strip() if name.strip() else "unknown"
 
 
 def _register_job(req: "TranscriptionRequest") -> None:
@@ -68,7 +76,7 @@ def _register_job(req: "TranscriptionRequest") -> None:
             "job_id": req.job_id,
             "file_url": req.file_url,
             "file_name": _extract_file_name(req.file_url),
-            "status": "queued",
+            "status": STATUS_QUEUED,
         }
 
 
@@ -114,7 +122,7 @@ def process_transcription(req: TranscriptionRequest):
         
         try:
             # Step 1: Download
-            _update_job_status(req.job_id, "downloading")
+            _update_job_status(req.job_id, STATUS_DOWNLOADING)
             logger.info("Step 1/3: Downloading audio...")
             audio_response = requests.get(req.file_url)
             audio_response.raise_for_status()
@@ -126,7 +134,7 @@ def process_transcription(req: TranscriptionRequest):
             payload_content = []
 
             # Step 2: Transcribe
-            _update_job_status(req.job_id, "transcribing")
+            _update_job_status(req.job_id, STATUS_TRANSCRIBING)
             if req.provider == "openai":
                 logger.info("Step 2/3: Using OpenAI Cloud API...")
                 client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
@@ -172,7 +180,7 @@ def process_transcription(req: TranscriptionRequest):
                     })
 
             # Step 3: Callback
-            _update_job_status(req.job_id, "completed")
+            _update_job_status(req.job_id, STATUS_COMPLETED)
             logger.info(f"Step 3/3: Pushing results to {req.callback_url}")
             payload = {
                     "job_id": req.job_id,
@@ -192,7 +200,7 @@ def process_transcription(req: TranscriptionRequest):
             logger.info(f"Callback status: {cb_res.status_code}")
 
         except Exception as e:
-            _update_job_status(req.job_id, "failed")
+            _update_job_status(req.job_id, STATUS_FAILED)
             logger.error(f"FATAL ERROR in job {req.job_id}: {str(e)}", exc_info=True)
             try:
                 requests.post(
@@ -231,5 +239,6 @@ async def start_transcription(req: TranscriptionRequest, background_tasks: Backg
 @app.get("/jobs", response_model=JobsResponse, dependencies=[Depends(verify_secret)])
 async def list_jobs():
     with jobs_lock:
-        job_list = [JobStatus(**job) for job in jobs.values()]
+        snapshot = list(jobs.values())
+    job_list = [JobStatus(**job) for job in snapshot]
     return JobsResponse(jobs=job_list)
