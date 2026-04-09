@@ -2,6 +2,7 @@ import os
 import logging
 import sys
 import threading
+from urllib.parse import urlparse, unquote
 from dotenv import load_dotenv
 import requests
 import datetime
@@ -37,6 +38,45 @@ else:
     logger.info(f"Concurrency limit: {MAX_CONCURRENT_JOBS}")
 
 app = FastAPI()
+
+# Job Registry
+jobs_lock = threading.Lock()
+jobs: dict[str, dict] = {}
+
+
+class JobStatus(BaseModel):
+    job_id: str
+    file_url: str
+    file_name: str
+    status: str
+
+
+class JobsResponse(BaseModel):
+    jobs: list[JobStatus]
+
+
+def _extract_file_name(url: str) -> str:
+    """Extract the original file name from a URL."""
+    path = urlparse(url).path
+    name = os.path.basename(unquote(path))
+    return name if name else "unknown"
+
+
+def _register_job(req: "TranscriptionRequest") -> None:
+    with jobs_lock:
+        jobs[req.job_id] = {
+            "job_id": req.job_id,
+            "file_url": req.file_url,
+            "file_name": _extract_file_name(req.file_url),
+            "status": "queued",
+        }
+
+
+def _update_job_status(job_id: str, status: str) -> None:
+    with jobs_lock:
+        if job_id in jobs:
+            jobs[job_id]["status"] = status
+
 
 # Configuration
 MODEL_SIZE = os.getenv("WHISPER_MODEL", "base")
@@ -74,6 +114,7 @@ def process_transcription(req: TranscriptionRequest):
         
         try:
             # Step 1: Download
+            _update_job_status(req.job_id, "downloading")
             logger.info("Step 1/3: Downloading audio...")
             audio_response = requests.get(req.file_url)
             audio_response.raise_for_status()
@@ -85,6 +126,7 @@ def process_transcription(req: TranscriptionRequest):
             payload_content = []
 
             # Step 2: Transcribe
+            _update_job_status(req.job_id, "transcribing")
             if req.provider == "openai":
                 logger.info("Step 2/3: Using OpenAI Cloud API...")
                 client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
@@ -130,6 +172,7 @@ def process_transcription(req: TranscriptionRequest):
                     })
 
             # Step 3: Callback
+            _update_job_status(req.job_id, "completed")
             logger.info(f"Step 3/3: Pushing results to {req.callback_url}")
             payload = {
                     "job_id": req.job_id,
@@ -149,6 +192,7 @@ def process_transcription(req: TranscriptionRequest):
             logger.info(f"Callback status: {cb_res.status_code}")
 
         except Exception as e:
+            _update_job_status(req.job_id, "failed")
             logger.error(f"FATAL ERROR in job {req.job_id}: {str(e)}", exc_info=True)
             try:
                 requests.post(
@@ -179,5 +223,13 @@ def process_transcription(req: TranscriptionRequest):
 @app.post("/transcribe", dependencies=[Depends(verify_secret)])
 async def start_transcription(req: TranscriptionRequest, background_tasks: BackgroundTasks):
     logger.info(f"New request for Job: {req.job_id}")
+    _register_job(req)
     background_tasks.add_task(process_transcription, req)
     return {"status": "accepted", "job_id": req.job_id}
+
+
+@app.get("/jobs", response_model=JobsResponse, dependencies=[Depends(verify_secret)])
+async def list_jobs():
+    with jobs_lock:
+        job_list = [JobStatus(**job) for job in jobs.values()]
+    return JobsResponse(jobs=job_list)
