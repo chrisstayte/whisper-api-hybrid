@@ -2,6 +2,7 @@ import os
 import logging
 import sys
 import threading
+from urllib.parse import urlparse, unquote
 from dotenv import load_dotenv
 import requests
 import datetime
@@ -23,11 +24,68 @@ logger = logging.getLogger(__name__)
 
 load_dotenv()
 
-# 2. Global Lock for Sequential Processing
-transcription_lock = threading.Lock()
+# 2. Concurrency Control
 local_model_lock = threading.Lock()
+try:
+    MAX_CONCURRENT_JOBS = int(os.getenv("MAX_CONCURRENT_JOBS", "0"))
+except ValueError:
+    logger.warning("Invalid MAX_CONCURRENT_JOBS value, defaulting to 0")
+    MAX_CONCURRENT_JOBS = 0
+if MAX_CONCURRENT_JOBS == 0:
+    transcription_semaphore = None
+    logger.info("Concurrency limit: unlimited")
+else:
+    transcription_semaphore = threading.Semaphore(MAX_CONCURRENT_JOBS)
+    logger.info(f"Concurrency limit: {MAX_CONCURRENT_JOBS}")
 
 app = FastAPI()
+
+# Job Registry (in-memory; job history is lost on application restart)
+jobs_lock = threading.Lock()
+jobs: dict[str, dict] = {}
+
+STATUS_QUEUED = "queued"
+STATUS_DOWNLOADING = "downloading"
+STATUS_TRANSCRIBING = "transcribing"
+STATUS_COMPLETED = "completed"
+STATUS_FAILED = "failed"
+
+
+class JobStatus(BaseModel):
+    job_id: str
+    file_url: str
+    file_name: str
+    status: str
+
+
+class JobsResponse(BaseModel):
+    jobs: list[JobStatus]
+
+
+def _extract_file_name(url: str) -> str:
+    """Extract the original file name from a URL, sanitized for safety."""
+    path = urlparse(url).path
+    name = os.path.basename(unquote(path))
+    # Remove any directory traversal or path separator characters
+    name = name.replace("..", "").replace("/", "").replace("\\", "")
+    return name.strip() if name.strip() else "unknown"
+
+
+def _register_job(req: "TranscriptionRequest") -> None:
+    with jobs_lock:
+        jobs[req.job_id] = {
+            "job_id": req.job_id,
+            "file_url": req.file_url,
+            "file_name": _extract_file_name(req.file_url),
+            "status": STATUS_QUEUED,
+        }
+
+
+def _update_job_status(job_id: str, status: str) -> None:
+    with jobs_lock:
+        if job_id in jobs:
+            jobs[job_id]["status"] = status
+
 
 # Configuration
 MODEL_SIZE = os.getenv("WHISPER_MODEL", "base")
@@ -105,11 +163,10 @@ async def verify_secret(x_callback_secret: Annotated[str | None, Header()] = Non
         raise HTTPException(status_code=401, detail="Invalid Callback Secret")
 
 def process_transcription(req: TranscriptionRequest):
-    # Sequential lock starts here
-    with transcription_lock:
+    def _run():
         temp_file = f"/tmp/{req.job_id}.mp3"
         provider = (req.provider or TRANSCRIPTION_PROVIDER).lower()
-        logger.info(f"--- LOCK ACQUIRED | STARTING JOB: {req.job_id} ---")
+        logger.info(f"--- SLOT ACQUIRED | STARTING JOB: {req.job_id} ---")
         logger.info(f"Callback url: {req.callback_url}")
         logger.info(f"Provider: {provider}")
         
@@ -121,6 +178,7 @@ def process_transcription(req: TranscriptionRequest):
                 )
 
             # Step 1: Download
+            _update_job_status(req.job_id, STATUS_DOWNLOADING)
             logger.info("Step 1/3: Downloading audio...")
             audio_response = requests.get(req.file_url)
             audio_response.raise_for_status()
@@ -132,6 +190,7 @@ def process_transcription(req: TranscriptionRequest):
             payload_content = []
 
             # Step 2: Transcribe
+            _update_job_status(req.job_id, STATUS_TRANSCRIBING)
             if provider in {"openai", "groq"}:
                 logger.info(f"Step 2/3: Using {provider.title()} Cloud API...")
                 client, model = get_cloud_client(provider)
@@ -169,6 +228,7 @@ def process_transcription(req: TranscriptionRequest):
                     })
 
             # Step 3: Callback
+            _update_job_status(req.job_id, STATUS_COMPLETED)
             logger.info(f"Step 3/3: Pushing results to {req.callback_url}")
             payload = {
                     "job_id": req.job_id,
@@ -188,6 +248,7 @@ def process_transcription(req: TranscriptionRequest):
             logger.info(f"Callback status: {cb_res.status_code}")
 
         except Exception as e:
+            _update_job_status(req.job_id, STATUS_FAILED)
             logger.error(f"FATAL ERROR in job {req.job_id}: {str(e)}", exc_info=True)
             try:
                 requests.post(
@@ -207,10 +268,25 @@ def process_transcription(req: TranscriptionRequest):
             if os.path.exists(temp_file):
                 os.remove(temp_file)
                 logger.info("Cleanup complete.")
-            logger.info(f"--- JOB {req.job_id} FINISHED | RELEASING LOCK ---")
+            logger.info(f"--- JOB {req.job_id} FINISHED | RELEASING SLOT ---")
+
+    if transcription_semaphore is not None:
+        with transcription_semaphore:
+            _run()
+    else:
+        _run()
 
 @app.post("/transcribe", dependencies=[Depends(verify_secret)])
 async def start_transcription(req: TranscriptionRequest, background_tasks: BackgroundTasks):
     logger.info(f"New request for Job: {req.job_id}")
+    _register_job(req)
     background_tasks.add_task(process_transcription, req)
     return {"status": "accepted", "job_id": req.job_id}
+
+
+@app.get("/jobs", response_model=JobsResponse, dependencies=[Depends(verify_secret)])
+async def list_jobs():
+    with jobs_lock:
+        snapshot = list(jobs.values())
+    job_list = [JobStatus(**job) for job in snapshot]
+    return JobsResponse(jobs=job_list)
