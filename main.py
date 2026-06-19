@@ -25,17 +25,34 @@ load_dotenv()
 
 # 2. Global Lock for Sequential Processing
 transcription_lock = threading.Lock()
+local_model_lock = threading.Lock()
 
 app = FastAPI()
 
 # Configuration
 MODEL_SIZE = os.getenv("WHISPER_MODEL", "base")
 USE_GPU = os.getenv("USE_GPU", "false").lower() == "true"
+TRANSCRIPTION_PROVIDER = os.getenv("TRANSCRIPTION_PROVIDER", "local").lower()
+OPENAI_TRANSCRIPTION_MODEL = os.getenv("OPENAI_TRANSCRIPTION_MODEL", "whisper-1")
+GROQ_TRANSCRIPTION_MODEL = os.getenv("GROQ_TRANSCRIPTION_MODEL", "whisper-large-v3-turbo")
+SUPPORTED_PROVIDERS = {"local", "openai", "groq"}
 device = "cuda" if USE_GPU else "cpu"
+local_model = None
 
-logger.info(f"Loading Whisper model: {MODEL_SIZE} on {device}...")
-local_model = WhisperModel(MODEL_SIZE, device=device, compute_type="int8")
-logger.info("Model loaded and ready.")
+def get_local_model():
+    global local_model
+    if local_model is None:
+        with local_model_lock:
+            if local_model is None:
+                logger.info(f"Loading Whisper model: {MODEL_SIZE} on {device}...")
+                local_model = WhisperModel(MODEL_SIZE, device=device, compute_type="int8")
+                logger.info("Model loaded and ready.")
+    return local_model
+
+if TRANSCRIPTION_PROVIDER == "local":
+    get_local_model()
+else:
+    logger.info(f"Skipping local Whisper model preload for provider: {TRANSCRIPTION_PROVIDER}")
 
 CALLBACK_SECRET = os.getenv("CALLBACK_SECRET")
 
@@ -43,11 +60,42 @@ class TranscriptionRequest(BaseModel):
     file_url: str
     job_id: str
     callback_url: str
-    provider: str = "local"
+    provider: str | None = None
 
 def format_timestamp(seconds: float) -> str:
     td = datetime.timedelta(seconds=int(seconds))
     return str(td).split('.')[0].zfill(8)[3:] if seconds < 3600 else str(td).split('.')[0].zfill(8)
+
+def get_cloud_client(provider: str):
+    if provider == "openai":
+        api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            raise ValueError("OPENAI_API_KEY is required when provider is openai")
+        return openai.OpenAI(api_key=api_key), OPENAI_TRANSCRIPTION_MODEL
+
+    if provider == "groq":
+        api_key = os.getenv("GROQ_API_KEY")
+        if not api_key:
+            raise ValueError("GROQ_API_KEY is required when provider is groq")
+        return (
+            openai.OpenAI(
+                api_key=api_key,
+                base_url="https://api.groq.com/openai/v1",
+            ),
+            GROQ_TRANSCRIPTION_MODEL,
+        )
+
+    raise ValueError(f"Unsupported cloud provider: {provider}")
+
+def append_segments(payload_content, segments, time_offset: float = 0.0):
+    for s in segments:
+        seg = s if isinstance(s, dict) else s.__dict__
+        start = seg["start"] + time_offset
+        end = seg["end"] + time_offset
+        payload_content.append({
+            "text": seg["text"].strip(),
+            "timestamp": f"{format_timestamp(start)}-{format_timestamp(end)}"
+        })
 
 async def verify_secret(x_callback_secret: Annotated[str | None, Header()] = None):
     if not CALLBACK_SECRET:
@@ -60,10 +108,18 @@ def process_transcription(req: TranscriptionRequest):
     # Sequential lock starts here
     with transcription_lock:
         temp_file = f"/tmp/{req.job_id}.mp3"
+        provider = (req.provider or TRANSCRIPTION_PROVIDER).lower()
         logger.info(f"--- LOCK ACQUIRED | STARTING JOB: {req.job_id} ---")
         logger.info(f"Callback url: {req.callback_url}")
+        logger.info(f"Provider: {provider}")
         
         try:
+            if provider not in SUPPORTED_PROVIDERS:
+                raise ValueError(
+                    f"Unsupported provider '{provider}'. "
+                    f"Supported providers: {', '.join(sorted(SUPPORTED_PROVIDERS))}"
+                )
+
             # Step 1: Download
             logger.info("Step 1/3: Downloading audio...")
             audio_response = requests.get(req.file_url)
@@ -76,9 +132,9 @@ def process_transcription(req: TranscriptionRequest):
             payload_content = []
 
             # Step 2: Transcribe
-            if req.provider == "openai":
-                logger.info("Step 2/3: Using OpenAI Cloud API...")
-                client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+            if provider in {"openai", "groq"}:
+                logger.info(f"Step 2/3: Using {provider.title()} Cloud API...")
+                client, model = get_cloud_client(provider)
                 audio = AudioSegment.from_file(temp_file)
                 
                 chunk_length_ms = 15 * 60 * 1000 
@@ -94,24 +150,16 @@ def process_transcription(req: TranscriptionRequest):
                     time_offset = i / 1000.0
                     with open(chunk_name, "rb") as f:
                         response = client.audio.transcriptions.create(
-                            model="whisper-1", 
+                            model=model,
                             file=f, 
-                            response_format="verbose_json"
+                            response_format="verbose_json",
                         )
-                        
-                        for s in response.segments:
-                            seg = s if isinstance(s, dict) else s.__dict__
-                            start = seg['start'] + time_offset
-                            end = seg['end'] + time_offset
-                            payload_content.append({
-                                "text": seg['text'].strip(),
-                                "timestamp": f"{format_timestamp(start)}-{format_timestamp(end)}"
-                            })
+                        append_segments(payload_content, response.segments, time_offset)
                     os.remove(chunk_name)
             
             else:
                 logger.info("Step 2/3: Using local Faster-Whisper...")
-                segments, info = local_model.transcribe(temp_file, beam_size=5)
+                segments, info = get_local_model().transcribe(temp_file, beam_size=5)
                 logger.info(f"Language: {info.language} ({info.language_probability:.2%})")
                 
                 for s in segments:

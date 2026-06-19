@@ -1,14 +1,14 @@
 # Whisper API Hybrid
 
-A FastAPI-based audio transcription service with a hybrid approach: run [faster-whisper](https://github.com/guillaumekln/faster-whisper) locally for private, cost-effective transcription, or offload to [OpenAI's Whisper API](https://platform.openai.com/docs/guides/speech-to-text) for higher throughput — switchable per request.
+A FastAPI-based audio transcription service with a hybrid approach: run [faster-whisper](https://github.com/guillaumekln/faster-whisper) locally for private, cost-effective transcription, or offload to OpenAI or Groq for higher throughput — switchable by environment default or per request.
 
 ## Features
 
-- **Hybrid providers** — choose `local` or `openai` per request
+- **Hybrid providers** — choose `local`, `openai`, or `groq` by default or per request
 - **Async job queue** — requests are accepted immediately and processed in the background
 - **Sequential locking** — a global lock prevents local model overload from concurrent jobs
 - **Webhook callbacks** — results are POSTed to your URL when done, no polling needed
-- **Large file support** — auto-splits audio into chunks for OpenAI's 25 MB limit
+- **Large file support** — auto-splits audio into chunks for cloud API file-size limits
 - **Optional auth** — secret token validation on both incoming requests and outgoing callbacks
 - **Multi-arch Docker image** — prebuilt for `linux/amd64` and `linux/arm64`
 
@@ -33,6 +33,12 @@ Edit `.env` with your values:
 ```dotenv
 # Required only if using the "openai" provider
 OPENAI_API_KEY=sk-proj-your-actual-key
+
+# Required only if using the "groq" provider
+GROQ_API_KEY=gsk_your-actual-key
+
+# Default provider: local, openai, or groq
+TRANSCRIPTION_PROVIDER=local
 
 # Local whisper model size: tiny, base, small, medium, large-v2
 WHISPER_MODEL=small
@@ -59,7 +65,11 @@ The API is available at `http://localhost:3443`.
 | `WHISPER_MODEL` | Local model size (`tiny`, `base`, `small`, `medium`, `large-v2`) | `base` |
 | `USE_GPU` | Enable CUDA for local transcription (requires NVIDIA GPU + runtime) | `false` |
 | `CALLBACK_SECRET` | Shared secret for authenticating requests and verifying callbacks | _none_ |
+| `TRANSCRIPTION_PROVIDER` | Default provider when a request does not specify one (`local`, `openai`, `groq`) | `local` |
 | `OPENAI_API_KEY` | OpenAI API key (required only when using the `openai` provider) | _none_ |
+| `OPENAI_TRANSCRIPTION_MODEL` | OpenAI transcription model | `whisper-1` |
+| `GROQ_API_KEY` | Groq API key (required only when using the `groq` provider) | _none_ |
+| `GROQ_TRANSCRIPTION_MODEL` | Groq transcription model | `whisper-large-v3-turbo` |
 
 ## Docker Compose Examples
 
@@ -110,9 +120,9 @@ volumes:
 
 Set `USE_GPU=true` in your `.env` file.
 
-### OpenAI-only (no local model needed)
+### Cloud-only (no local model needed)
 
-If you only plan to use the OpenAI provider, the container still starts the local model on boot. For the smallest footprint, use `WHISPER_MODEL=tiny`.
+If `TRANSCRIPTION_PROVIDER` is set to `openai` or `groq`, the local model is not loaded on boot. If a request later overrides the provider to `local`, the model loads on that first local job.
 
 ```yaml
 services:
@@ -121,7 +131,8 @@ services:
     ports:
       - "3443:8000"
     environment:
-      - OPENAI_API_KEY=sk-proj-your-key
+      - TRANSCRIPTION_PROVIDER=groq
+      - GROQ_API_KEY=gsk_your-key
       - WHISPER_MODEL=tiny
     restart: unless-stopped
 ```
@@ -213,7 +224,9 @@ Submits an audio file for transcription. The job is processed asynchronously and
 | `file_url` | string | yes | Direct URL to the audio file |
 | `job_id` | string | yes | Unique identifier for this job |
 | `callback_url` | string | yes | URL where results will be POSTed |
-| `provider` | string | no | `local` (default) or `openai` |
+| `provider` | string | no | Overrides `TRANSCRIPTION_PROVIDER`; supported values are `local`, `openai`, and `groq` |
+
+Omit `provider` to use the configured `TRANSCRIPTION_PROVIDER`. For example, set `TRANSCRIPTION_PROVIDER=groq` and `GROQ_API_KEY=...` in `.env` to send all default jobs to Groq.
 
 **Response** `200 OK`
 
@@ -267,7 +280,7 @@ The callback includes the `X-Callback-Secret` header if `CALLBACK_SECRET` is con
 2. **Queue** — the server accepts immediately and processes in the background
 3. **Lock** — a global lock ensures only one job runs at a time (prevents local model overload)
 4. **Download** — the audio file is downloaded to a temp location
-5. **Transcribe** — either locally via faster-whisper, or via OpenAI (auto-chunked if needed)
+5. **Transcribe** — either locally via faster-whisper, or via OpenAI/Groq (auto-chunked if needed)
 6. **Callback** — results (text + timestamps) are POSTed to your callback URL
 7. **Cleanup** — temp files are deleted
 
@@ -305,6 +318,6 @@ Requires Python 3.10+ and ffmpeg installed on your system.
 
 - [FastAPI](https://fastapi.tiangolo.com/) — web framework
 - [faster-whisper](https://github.com/guillaumekln/faster-whisper) — local transcription engine
-- [OpenAI Python](https://github.com/openai/openai-python) — cloud transcription
+- [OpenAI Python](https://github.com/openai/openai-python) — OpenAI and Groq-compatible cloud transcription
 - [PyDub](https://github.com/jiaaro/pydub) — audio chunking
 - [FFmpeg](https://ffmpeg.org/) — audio processing (installed in Docker image)
