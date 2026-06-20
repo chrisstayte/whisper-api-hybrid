@@ -2,6 +2,7 @@ import os
 import logging
 import sys
 import threading
+import json
 from urllib.parse import urlparse, unquote
 from dotenv import load_dotenv
 import requests
@@ -155,6 +156,18 @@ def append_segments(payload_content, segments, time_offset: float = 0.0):
             "timestamp": f"{format_timestamp(start)}-{format_timestamp(end)}"
         })
 
+def log_callback_payload_for_bad_request(payload: dict, response: requests.Response) -> None:
+    payload_for_log = payload.copy()
+    if payload_for_log.get("secret"):
+        payload_for_log["secret"] = "[REDACTED]"
+
+    logger.error("CMS callback returned 400 Bad Request.")
+    logger.error(f"CMS response body: {response.text}")
+    logger.error(
+        "Callback payload: %s",
+        json.dumps(payload_for_log, ensure_ascii=False, default=str),
+    )
+
 async def verify_secret(x_callback_secret: Annotated[str | None, Header()] = None):
     if not CALLBACK_SECRET:
         return 
@@ -246,6 +259,8 @@ def process_transcription(req: TranscriptionRequest):
                 timeout=30
             )
             logger.info(f"Callback status: {cb_res.status_code}")
+            if cb_res.status_code == 400:
+                log_callback_payload_for_bad_request(payload, cb_res)
 
         except Exception as e:
             _update_job_status(req.job_id, STATUS_FAILED)
