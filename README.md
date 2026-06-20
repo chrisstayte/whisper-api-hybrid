@@ -247,6 +247,9 @@ When transcription completes, the service sends a `POST` to your `callback_url`.
 
 The callback includes the `X-Callback-Secret` header if `CALLBACK_SECRET` is configured.
 
+Empty transcription segments are discarded before sending the callback payload because
+CMS receivers may reject `transcription` items whose `text` value is blank.
+
 **Success**
 
 ```json

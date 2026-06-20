@@ -146,15 +146,27 @@ def get_cloud_client(provider: str):
 
     raise ValueError(f"Unsupported cloud provider: {provider}")
 
+def append_payload_segment(payload_content, text: str, start: float, end: float) -> None:
+    text = text.strip()
+    if not text:
+        logger.info(
+            "Skipping empty transcription segment at %s-%s",
+            format_timestamp(start),
+            format_timestamp(end),
+        )
+        return
+
+    payload_content.append({
+        "text": text,
+        "timestamp": f"{format_timestamp(start)}-{format_timestamp(end)}"
+    })
+
 def append_segments(payload_content, segments, time_offset: float = 0.0):
     for s in segments:
         seg = s if isinstance(s, dict) else s.__dict__
         start = seg["start"] + time_offset
         end = seg["end"] + time_offset
-        payload_content.append({
-            "text": seg["text"].strip(),
-            "timestamp": f"{format_timestamp(start)}-{format_timestamp(end)}"
-        })
+        append_payload_segment(payload_content, seg["text"], start, end)
 
 def log_callback_payload_for_bad_request(payload: dict, response: requests.Response) -> None:
     payload_for_log = payload.copy()
@@ -235,10 +247,7 @@ def process_transcription(req: TranscriptionRequest):
                 logger.info(f"Language: {info.language} ({info.language_probability:.2%})")
                 
                 for s in segments:
-                    payload_content.append({
-                        "text": s.text.strip(),
-                        "timestamp": f"{format_timestamp(s.start)}-{format_timestamp(s.end)}"
-                    })
+                    append_payload_segment(payload_content, s.text, s.start, s.end)
 
             # Step 3: Callback
             _update_job_status(req.job_id, STATUS_COMPLETED)
