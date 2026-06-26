@@ -3,6 +3,7 @@ import logging
 import sys
 import threading
 import json
+import subprocess
 from urllib.parse import urlparse, unquote
 from dotenv import load_dotenv
 import requests
@@ -12,7 +13,6 @@ from fastapi import FastAPI, BackgroundTasks, HTTPException, Header, Depends
 from pydantic import BaseModel
 from faster_whisper import WhisperModel
 import openai
-from pydub import AudioSegment
 from typing import Annotated
 
 # 1. Setup Logging
@@ -95,6 +95,7 @@ TRANSCRIPTION_PROVIDER = os.getenv("TRANSCRIPTION_PROVIDER", "local").lower()
 OPENAI_TRANSCRIPTION_MODEL = os.getenv("OPENAI_TRANSCRIPTION_MODEL", "whisper-1")
 GROQ_TRANSCRIPTION_MODEL = os.getenv("GROQ_TRANSCRIPTION_MODEL", "whisper-large-v3-turbo")
 SUPPORTED_PROVIDERS = {"local", "openai", "groq"}
+CLOUD_CHUNK_LENGTH_SECONDS = 15 * 60
 device = "cuda" if USE_GPU else "cpu"
 local_model = None
 
@@ -180,6 +181,69 @@ def log_callback_payload_for_bad_request(payload: dict, response: requests.Respo
         json.dumps(payload_for_log, ensure_ascii=False, default=str),
     )
 
+def download_audio_to_file(file_url: str, output_path: str) -> None:
+    with requests.get(file_url, stream=True, timeout=(10, 300)) as audio_response:
+        audio_response.raise_for_status()
+        with open(output_path, "wb") as f:
+            for chunk in audio_response.iter_content(chunk_size=1024 * 1024):
+                if chunk:
+                    f.write(chunk)
+
+def get_audio_duration_seconds(audio_path: str) -> float:
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "json",
+                audio_path,
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        stderr = exc.stderr.strip() if exc.stderr else "no stderr"
+        raise RuntimeError(f"ffprobe failed while reading audio duration: {stderr}") from exc
+
+    metadata = json.loads(result.stdout)
+    duration = float(metadata["format"]["duration"])
+    if duration <= 0:
+        raise ValueError("Audio duration must be greater than zero")
+    return duration
+
+def export_audio_chunk(source_path: str, chunk_path: str, start_seconds: float, duration_seconds: float) -> None:
+    try:
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-ss",
+                str(start_seconds),
+                "-t",
+                str(duration_seconds),
+                "-i",
+                source_path,
+                "-vn",
+                "-acodec",
+                "libmp3lame",
+                "-y",
+                chunk_path,
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        stderr = exc.stderr.strip() if exc.stderr else "no stderr"
+        raise RuntimeError(f"ffmpeg failed while exporting audio chunk: {stderr}") from exc
+
 async def verify_secret(x_callback_secret: Annotated[str | None, Header()] = None):
     if not CALLBACK_SECRET:
         return 
@@ -205,11 +269,7 @@ def process_transcription(req: TranscriptionRequest):
             # Step 1: Download
             _update_job_status(req.job_id, STATUS_DOWNLOADING)
             logger.info("Step 1/3: Downloading audio...")
-            audio_response = requests.get(req.file_url)
-            audio_response.raise_for_status()
-            
-            with open(temp_file, "wb") as f:
-                f.write(audio_response.content)
+            download_audio_to_file(req.file_url, temp_file)
             logger.info(f"Download complete: {temp_file}")
 
             payload_content = []
@@ -219,27 +279,34 @@ def process_transcription(req: TranscriptionRequest):
             if provider in {"openai", "groq"}:
                 logger.info(f"Step 2/3: Using {provider.title()} Cloud API...")
                 client, model = get_cloud_client(provider)
-                audio = AudioSegment.from_file(temp_file)
-                
-                chunk_length_ms = 15 * 60 * 1000 
-                duration_ms = len(audio)
-                total_chunks = math.ceil(duration_ms / chunk_length_ms)
+                duration_seconds = get_audio_duration_seconds(temp_file)
+                total_chunks = math.ceil(duration_seconds / CLOUD_CHUNK_LENGTH_SECONDS)
 
-                for idx, i in enumerate(range(0, duration_ms, chunk_length_ms)):
+                for idx in range(total_chunks):
+                    start_seconds = idx * CLOUD_CHUNK_LENGTH_SECONDS
+                    chunk_duration_seconds = min(
+                        CLOUD_CHUNK_LENGTH_SECONDS,
+                        duration_seconds - start_seconds,
+                    )
                     logger.info(f"Processing chunk {idx + 1}/{total_chunks}...")
-                    chunk = audio[i : i + chunk_length_ms]
                     chunk_name = f"/tmp/{req.job_id}_chunk_{idx}.mp3"
-                    chunk.export(chunk_name, format="mp3")
-                    
-                    time_offset = i / 1000.0
-                    with open(chunk_name, "rb") as f:
-                        response = client.audio.transcriptions.create(
-                            model=model,
-                            file=f, 
-                            response_format="verbose_json",
+                    try:
+                        export_audio_chunk(
+                            temp_file,
+                            chunk_name,
+                            start_seconds,
+                            chunk_duration_seconds,
                         )
-                        append_segments(payload_content, response.segments, time_offset)
-                    os.remove(chunk_name)
+                        with open(chunk_name, "rb") as f:
+                            response = client.audio.transcriptions.create(
+                                model=model,
+                                file=f,
+                                response_format="verbose_json",
+                            )
+                            append_segments(payload_content, response.segments, start_seconds)
+                    finally:
+                        if os.path.exists(chunk_name):
+                            os.remove(chunk_name)
             
             else:
                 logger.info("Step 2/3: Using local Faster-Whisper...")
@@ -306,6 +373,11 @@ async def start_transcription(req: TranscriptionRequest, background_tasks: Backg
     _register_job(req)
     background_tasks.add_task(process_transcription, req)
     return {"status": "accepted", "job_id": req.job_id}
+
+
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
 
 
 @app.get("/jobs", response_model=JobsResponse, dependencies=[Depends(verify_secret)])

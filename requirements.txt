@@ -4,5 +4,4 @@ requests
 pydantic
 faster-whisper
 openai
-pydub
 python-dotenv

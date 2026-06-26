@@ -61,6 +61,12 @@ docker compose up -d
 
 The API is available at `http://localhost:3443`.
 
+Health check endpoint:
+
+```bash
+curl http://localhost:3443/health
+```
+
 ## Environment Variables
 
 | Variable | Description | Default |
@@ -74,6 +80,8 @@ The API is available at `http://localhost:3443`.
 | `GROQ_API_KEY` | Groq API key (required only when using the `groq` provider) | _none_ |
 | `GROQ_TRANSCRIPTION_MODEL` | Groq transcription model | `whisper-large-v3-turbo` |
 | `MAX_CONCURRENT_JOBS` | Maximum number of transcription jobs that can run at the same time (`0` = unlimited) | `0` |
+
+For small VPS deployments, start with `MAX_CONCURRENT_JOBS=1` and raise it only after watching memory usage under real audio loads. Cloud transcription jobs stream the download to disk and chunk with `ffmpeg`, but each active job still has network, temp file, and callback payload overhead.
 
 ## Docker Compose Examples
 
